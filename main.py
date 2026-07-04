@@ -1,97 +1,92 @@
 import time
 import uuid
-from typing import List
+from collections import defaultdict, deque
 
-import jwt
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from starlette.middleware.base import BaseHTTPMiddleware
-
-EMAIL = "24f2005453@ds.study.iitm.ac.in"
-
-ALLOWED_ORIGIN = "https://dash-1agokr.example.com"
-
-ISSUER = "https://idp.exam.local"
-AUDIENCE = "tds-fs7lqb3m.apps.exam.local"
-
-PUBLIC_KEY = """
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
-cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
-EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
-WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
-ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
-SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
-dQIDAQAB
------END PUBLIC KEY-----
-"""
 
 app = FastAPI()
 
+# Allow all origins for the browser-based grader
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_credentials=False,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+TOTAL_ORDERS = 55
+RATE_LIMIT = 17
+WINDOW = 10  # seconds
 
-class TimingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        start = time.perf_counter()
-        response = await call_next(request)
-        duration = time.perf_counter() - start
+# Fixed catalog of orders
+catalog = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
 
-        response.headers["X-Request-ID"] = str(uuid.uuid4())
-        response.headers["X-Process-Time"] = f"{duration:.6f}"
+# Idempotency storage
+idempotency_store = {}
 
-        return response
-
-
-app.add_middleware(TimingMiddleware)
+# Rate limit buckets
+client_requests = defaultdict(deque)
 
 
-@app.get("/stats")
-def stats(values: str = Query(...)):
-    nums: List[int] = [int(x.strip()) for x in values.split(",") if x.strip()]
+class OrderCreate(BaseModel):
+    item: str | None = None
+    quantity: int | None = 1
 
-    return {
-        "email": EMAIL,
-        "count": len(nums),
-        "sum": sum(nums),
-        "min": min(nums),
-        "max": max(nums),
-        "mean": sum(nums) / len(nums),
+
+@app.middleware("http")
+async def rate_limit(request, call_next):
+    client = request.headers.get("X-Client-Id", "anonymous")
+
+    now = time.time()
+    bucket = client_requests[client]
+
+    while bucket and bucket[0] <= now - WINDOW:
+        bucket.popleft()
+
+    if len(bucket) >= RATE_LIMIT:
+        retry_after = int(WINDOW - (now - bucket[0])) + 1
+        return Response(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    bucket.append(now)
+
+    return await call_next(request)
+
+
+@app.post("/orders", status_code=201)
+def create_order(
+    order: OrderCreate,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
+
+    created = {
+        "id": str(uuid.uuid4()),
+        "item": order.item,
+        "quantity": order.quantity,
     }
 
+    idempotency_store[idempotency_key] = created
 
-class VerifyRequest(BaseModel):
-    token: str
+    return created
 
 
-@app.post("/verify")
-def verify(req: VerifyRequest):
-    try:
-        claims = jwt.decode(
-            req.token,
-            PUBLIC_KEY,
-            algorithms=["RS256"],
-            issuer=ISSUER,
-            audience=AUDIENCE,
-        )
+@app.get("/orders")
+def list_orders(limit: int = 10, cursor: str | None = None):
+    start = int(cursor) if cursor else 0
 
-        return {
-            "valid": True,
-            "email": claims.get("email"),
-            "sub": claims.get("sub"),
-            "aud": claims.get("aud"),
-        }
+    items = catalog[start:start + limit]
 
-    except jwt.PyJWTError:
-        return JSONResponse(
-            status_code=401,
-            content={"valid": False},
-        )
+    next_cursor = None
+    if start + limit < len(catalog):
+        next_cursor = str(start + limit)
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+    }
