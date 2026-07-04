@@ -1,4 +1,2 @@
 fastapi
 uvicorn
-PyJWT[crypto]
-cryptography
